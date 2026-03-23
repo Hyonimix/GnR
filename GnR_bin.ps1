@@ -45,7 +45,7 @@ $dragDropHandler = {
     $files = $_.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
     if ($files.Count -gt 0) {
         $path = $files[0]
-        if ((Get-Item $path) -is [System.IO.DirectoryInfo]) {
+        if ((Get-Item -LiteralPath $path) -is [System.IO.DirectoryInfo]) {
             $txtPath.Text = $path
         } else {
             [System.Windows.Forms.MessageBox]::Show("Only folders can be dragged and dropped.", "Info", 0, 48) | Out-Null
@@ -82,7 +82,10 @@ $cmbEncoding.Location = New-Object System.Drawing.Point(20, 155)
 $cmbEncoding.Size = New-Object System.Drawing.Size(200, 20)
 $cmbEncoding.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 $cmbEncoding.Items.Add("Default")
-$cmbEncoding.Items.Add("UTF8")
+$cmbEncoding.Items.Add("UTF-8")
+$cmbEncoding.Items.Add("UTF-8 BOM")
+$cmbEncoding.Items.Add("ANSI")
+$cmbEncoding.Items.Add("SHIFT-JIS")
 $cmbEncoding.SelectedIndex = 0
 $form.Controls.Add($cmbEncoding)
 
@@ -142,7 +145,7 @@ $btnRun.Size = New-Object System.Drawing.Size(440, 50)
 $btnRun.Font = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Bold)
 $btnRun.Add_Click({
     $sourcePath = $txtPath.Text
-    if (-not (Test-Path $sourcePath)) {
+    if (-not (Test-Path -LiteralPath $sourcePath)) {
         [System.Windows.Forms.MessageBox]::Show("Please select a valid folder.", "Error", 0, 16) | Out-Null
         return
     }
@@ -163,37 +166,63 @@ $btnRun.Add_Click({
 
         $extensions = $txtExt.Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
         
-        $selectedEnc = if ($cmbEncoding.SelectedIndex -eq 1) { "UTF8" } else { "Default" }
+            $encObj = switch ($cmbEncoding.SelectedItem.ToString()) {
+                "Default" { [System.Text.Encoding]::Default }
+                "UTF-8" { New-Object System.Text.UTF8Encoding($false) }
+                "UTF-8 BOM" { New-Object System.Text.UTF8Encoding($true) }
+                "ANSI" { [System.Text.Encoding]::Default }
+                "SHIFT-JIS" { [System.Text.Encoding]::GetEncoding("shift_jis") }
+                default { [System.Text.Encoding]::Default }
+            }
 
-        $lblStatus.Text = "Replacing file contents..."
-        [System.Windows.Forms.Application]::DoEvents()
+            $lblStatus.Text = "Replacing file contents..."
+            [System.Windows.Forms.Application]::DoEvents()
         
-        $filesToContentReplace = Get-ChildItem -Path $tempDir -Recurse -File -Include $extensions
-        foreach ($file in $filesToContentReplace) {
-            $content = Get-Content -Path $file.FullName -Raw -Encoding $selectedEnc
-            $isModified = $false
+            $filesToContentReplace = Get-ChildItem -Path $tempDir -Recurse -File -Include $extensions
+            foreach ($file in $filesToContentReplace) {
+                $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            
+                if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 
+                    $readEnc = New-Object System.Text.UTF8Encoding($true) 
+                }
+                elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { 
+                    $readEnc = [System.Text.Encoding]::Unicode 
+                }
+                else {
+                    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+                    try {
+                        $null = $strictUtf8.GetString($bytes)
+                        $readEnc = New-Object System.Text.UTF8Encoding($false)
+                    }
+                    catch {
+                        $readEnc = [System.Text.Encoding]::GetEncoding("shift_jis")
+                    }
+                }
 
-            foreach ($rule in $rules) {
-                $split = $rule -split '\|', 2
-                $search = $split[0]
-                $replace = $split[1]
+                $content = [System.IO.File]::ReadAllText($file.FullName, $readEnc)
+                $isModified = $false
 
-                if ($content -match [regex]::Escape($search)) {
-                    $content = $content.Replace($search, $replace)
-                    $isModified = $true
+                foreach ($rule in $rules) {
+                    $split = $rule -split '\|', 2
+                    $search = $split[0]
+                    $replace = $split[1]
+
+                    if ($content -cmatch [regex]::Escape($search)) {
+                        $content = $content.Replace($search, $replace)
+                        $isModified = $true
+                    }
+                }
+
+                if ($isModified) {
+                    [System.IO.File]::WriteAllText($file.FullName, $content, $encObj)
                 }
             }
-
-            if ($isModified) {
-                Set-Content -Path $file.FullName -Value $content -Encoding $selectedEnc -NoNewline
-            }
-        }
 
         if ($optAll.Checked) {
             $lblStatus.Text = "Replacing file and folder names..."
             [System.Windows.Forms.Application]::DoEvents()
 
-            $itemsToRename = Get-ChildItem -Path $tempDir -Recurse | Sort-Object -Property @{Expression={$_.FullName.Length}; Descending=$true}
+            $itemsToRename = Get-ChildItem -Path $tempDir -Recurse | Sort-Object -Property @{Expression={($_.FullName.Length - $_.FullName.Replace('\','').Length)}; Descending=$true}
             foreach ($item in $itemsToRename) {
                 $newName = $item.Name
                 $isModified = $false
@@ -210,7 +239,7 @@ $btnRun.Add_Click({
                 }
 
                 if ($isModified) {
-                    Rename-Item -Path $item.FullName -NewName $newName
+                    Rename-Item -LiteralPath $item.FullName -NewName $newName
                 }
             }
         }
@@ -222,12 +251,12 @@ $btnRun.Add_Click({
         $folderName = Split-Path $sourcePath -Leaf
         $zipPath = Join-Path $parentFolder "${folderName}_Modified_$((Get-Date).ToString('yyyyMMdd_HHmmss')).zip"
         
-        if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+        if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
         [System.IO.Compression.ZipFile]::CreateFromDirectory($tempDir, $zipPath)
 
         $lblStatus.Text = "Cleaning up temp files..."
         [System.Windows.Forms.Application]::DoEvents()
-        Remove-Item -Path $tempDir -Recurse -Force
+        Remove-Item -LiteralPath $tempDir -Recurse -Force
 
         $lblStatus.Text = "Done."
         [System.Windows.Forms.MessageBox]::Show("Process completed!`n`nSaved at: $zipPath", "Complete", 0, 64) | Out-Null
